@@ -163,7 +163,6 @@ Include a `LICENSE` file (MIT recommended for academic code). Replace `YEAR` and
 ## Contact
 
 Email id: — `kushkapoor.kk1234@gmail.com`
-GitHub: `https://github.com/KushKapoor1234/'
 
 ---
 
