@@ -1,0 +1,21 @@
+--- 5-Fold Stratified Group Cross-Validation Report ---
+
+              precision    recall  f1-score   support
+
+           N       0.96      0.95      0.95     90042
+           Q       0.00      0.00      0.00         0
+           S       0.09      0.03      0.05      2779
+           V       0.61      0.83      0.70      7006
+
+    accuracy                           0.92     99827
+   macro avg       0.41      0.45      0.43     99827
+weighted avg       0.91      0.92      0.91     99827
+
+
+Mean Metrics (from folds):
+fold  accuracy  precision_macro  recall_macro  f1_macro  n_test_samples
+Mean  0.917061         0.664281      0.623677   0.58066         19965.4
+
+StdDev Metrics (from folds):
+  fold  accuracy  precision_macro  recall_macro  f1_macro  n_test_samples
+StdDev   0.04165          0.12302      0.032984  0.037973     1471.033072

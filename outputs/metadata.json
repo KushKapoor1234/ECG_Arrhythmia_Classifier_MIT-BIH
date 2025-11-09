@@ -1,0 +1,73 @@
+{
+    "dataset": "MIT-BIH Arrhythmia Database",
+    "records_loaded": 44,
+    "records_excluded": [
+        "102",
+        "104",
+        "107",
+        "217"
+    ],
+    "total_beats_extracted": 99827,
+    "class_map": {
+        "N": "N",
+        "L": "N",
+        "R": "N",
+        "e": "N",
+        "j": "N",
+        "V": "V",
+        "E": "V",
+        "A": "S",
+        "a": "S",
+        "J": "S",
+        "S": "S",
+        "/": "Q"
+    },
+    "final_classes": [
+        "N",
+        "S",
+        "V"
+    ],
+    "signal_processing": {
+        "filter_type": "Butterworth Bandpass",
+        "filter_params": {
+            "low": 5.0,
+            "high": 40.0,
+            "order": 3
+        }
+    },
+    "features": {
+        "names": [
+            "rr_pre_ms",
+            "rr_post_ms",
+            "qrs_amplitude_max_mv",
+            "qrs_amplitude_min_mv",
+            "qrs_area_mvs",
+            "qrs_width_ms",
+            "qrs_max_slope_mv_per_s",
+            "qrs_spectral_entropy"
+        ],
+        "count": 8
+    },
+    "model": {
+        "type": "RandomForestClassifier",
+        "pipeline": [
+            "StandardScaler",
+            "RandomForestClassifier"
+        ],
+        "n_estimators": 150,
+        "class_weight": "balanced"
+    },
+    "validation": {
+        "type": "StratifiedGroupKFold (fallback: GroupKFold)",
+        "n_splits": 5
+    },
+    "seed": 42,
+    "env": {
+        "python_version": "3.12.3 (main, Aug 14 2025, 17:47:21) [GCC 13.3.0]",
+        "platform": "Linux-6.8.0-86-generic-x86_64-with-glibc2.39",
+        "numpy": "2.3.4",
+        "scikit-learn": "1.7.2",
+        "wfdb": "4.3.0",
+        "pandas": "2.3.3"
+    }
+}
