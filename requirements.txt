@@ -1,0 +1,8 @@
+# requirements.txt
+numpy
+scipy
+scikit-learn
+matplotlib
+wfdb
+tqdm
+pandas
