@@ -1,0 +1,5 @@
+Google Drive Download link for models (.joblib)
+Save in this directory only
+
+https://drive.google.com/drive/folders/1nqCVH8yuVw1Op8BAayPGH_mzGC2PchDp?usp=sharing
+
