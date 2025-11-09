@@ -111,14 +111,6 @@ python eval/infer_on_record.py
 # writes results/eval_outputs/inference/<record>_predictions.csv and classification report
 ```
 
-**Predict on a CSV of precomputed features**:
-
-```bash
-# Prepare data/features_to_predict.csv with columns exactly matching FEATURE_NAMES in src/feature_extractor.py
-python eval/infer_on_feature_csv.py
-# writes results/eval_outputs/inference/features_to_predict_preds.csv
-```
-
 **Visualize example beat windows with predictions**:
 
 ```bash
