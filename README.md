@@ -41,7 +41,6 @@ These metrics are derived from `cv_metrics_summary.csv` (classifier) and the det
 │   └── visualizer.py                # plotting helpers
 ├── eval/                            # evaluation & inference scripts
 │   ├── infer_on_record.py
-│   ├── infer_on_feature_csv.py
 │   ├── analyze_detector.py
 │   └── visualize_predictions.py
 ├── data/                            # **NOT** committed: MIT-BIH .dat/.hea/.atr files
