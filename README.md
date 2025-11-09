@@ -154,12 +154,6 @@ Maintaining order & units is crucial when constructing feature CSVs for `infer_o
 
 ---
 
-## License
-
-Include a `LICENSE` file (MIT recommended for academic code). Replace `YEAR` and `Your Name` as appropriate.
-
----
-
 ## Contact
 
 Email id: — `kushkapoor.kk1234@gmail.com`
