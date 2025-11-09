@@ -163,7 +163,3 @@ Email id: — `kushkapoor.kk1234@gmail.com`
 ## Acknowledgements / Data citation
 
 MIT-BIH Arrhythmia Database: Goldberger AL et al., PhysioBank, PhysioToolkit, and PhysioNet: Components of a new research resource for complex physiologic signals. Circulation 2000;101(23):e215–e220.
-
----
-
-*End of README*
