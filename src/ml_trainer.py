@@ -1,178 +1,180 @@
+# src/ml_trainer.py
+"""
+Minimal ML training & evaluation helper for ECG project.
+
+Function:
+  train_and_evaluate(X, y, groups, class_names, models_dir, plots_dir, seed=42, n_splits=5)
+
+Behavior:
+ - Automatically adjusts n_splits if there are fewer unique groups than requested.
+ - Tries to use StratifiedGroupKFold; falls back to GroupKFold or StratifiedKFold as needed.
+ - Returns (classification_report_text, conf_matrix_path, metrics_csv_path, final_model_path, classes_array)
+"""
 import os
-import joblib
+import warnings
+from typing import List, Tuple, Any
+
 import numpy as np
 import pandas as pd
-from collections import Counter
-
-# StratifiedGroupKFold may not be available in older sklearn; fallback gracefully
-try:
-    from sklearn.model_selection import StratifiedGroupKFold
-
-    SGKF_AVAILABLE = True
-except Exception:
-    from sklearn.model_selection import GroupKFold as StratifiedGroupKFold
-
-    SGKF_AVAILABLE = False
-
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import (
-    classification_report,
-    ConfusionMatrixDisplay,
-    accuracy_score,
-    precision_recall_fscore_support,
-)
-import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score, precision_score, recall_score
+from sklearn.model_selection import GroupKFold, StratifiedKFold
+import joblib
 
-# new import for balancing
-from imblearn.over_sampling import RandomOverSampler
+# Try import of StratifiedGroupKFold (newer sklearn versions)
+try:
+    from sklearn.model_selection import StratifiedGroupKFold  # type: ignore
+    HAS_SGKF = True
+except Exception:
+    StratifiedGroupKFold = None  # type: ignore
+    HAS_SGKF = False
 
 
-def train_and_evaluate(X, y, groups, class_names, models_dir, plots_dir, seed=42):
+def _ensure_dir(d):
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+
+def train_and_evaluate(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    class_names: List[Any],
+    models_dir: str,
+    plots_dir: str,
+    seed: int = 42,
+    n_splits: int = 5,
+) -> Tuple[str, str, str, str, np.ndarray]:
     """
-    Performs a 5-Fold StratifiedGroup (fallback Group) cross-validation.
-    Applies RandomOverSampler on the training fold to mitigate class imbalance.
-    Returns (report_text, confusion_matrix_path, metrics_csv_path, final_model_path, final_classes)
+    Train and evaluate a RandomForest pipeline with group-aware CV.
+    Returns:
+      report_text, confusion_matrix_path, metrics_csv_path, final_model_path, classes_array
     """
-    os.makedirs(models_dir, exist_ok=True)
-    os.makedirs(plots_dir, exist_ok=True)
+    _ensure_dir(models_dir)
+    _ensure_dir(plots_dir)
 
-    n_splits = 5
+    # Basic validation
+    X = np.asarray(X)
+    y = np.asarray(y)
+    groups = np.asarray(groups)
 
-    # Basic validity checks
     if X.size == 0 or y.size == 0:
         raise ValueError("Empty feature matrix or labels passed to train_and_evaluate.")
 
+    if X.shape[0] != y.shape[0]:
+        raise ValueError("X and y must have the same number of samples.")
+    if groups.shape[0] != y.shape[0]:
+        # try broadcasting groups if single group provided
+        if groups.size == 1:
+            groups = np.repeat(groups, y.shape[0])
+        else:
+            raise ValueError("groups must have same length as y or be a single value.")
+
     unique_groups = np.unique(groups)
-    if unique_groups.shape[0] < n_splits:
-        raise ValueError(
-            f"Number of unique groups ({unique_groups.shape[0]}) < n_splits ({n_splits}). Reduce n_splits."
-        )
+    n_groups = len(unique_groups)
 
-    # Create the splitter
-    if SGKF_AVAILABLE:
-        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    # Adjust n_splits to number of groups when necessary
+    if n_groups < 2:
+        warnings.warn("Only one unique group found. Falling back to sample-based StratifiedKFold.")
+        # use stratified kfold on samples
+        cv = StratifiedKFold(n_splits=min(n_splits, max(2, min(5, len(y)))), shuffle=True, random_state=seed)
     else:
-        print("Warning: StratifiedGroupKFold not available, using GroupKFold fallback (no stratification).")
-        sgkf = StratifiedGroupKFold(n_splits=n_splits)
+        # ensure requested splits isn't greater than groups
+        if n_splits > n_groups:
+            old = n_splits
+            n_splits = n_groups
+            print(f"[ml_trainer] Warning: requested n_splits={old} > unique groups={n_groups}; reducing n_splits -> {n_splits}")
 
-    all_y_test = []
-    all_y_pred = []
-    fold_metrics_list = []
+        # prefer StratifiedGroupKFold if available
+        if HAS_SGKF and StratifiedGroupKFold is not None:
+            try:
+                cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+            except Exception:
+                # fallback to GroupKFold
+                cv = GroupKFold(n_splits=n_splits)
+        else:
+            # fallback to GroupKFold (no stratification across classes)
+            cv = GroupKFold(n_splits=n_splits)
 
-    print(f"Starting {n_splits}-Fold {'StratifiedGroupKFold' if SGKF_AVAILABLE else 'GroupKFold'} Cross-Validation...")
+    # Build a simple pipeline
+    pipeline = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("clf", RandomForestClassifier(n_estimators=150, class_weight="balanced", random_state=seed, n_jobs=-1)),
+        ]
+    )
 
-    for fold, (train_idx, test_idx) in enumerate(sgkf.split(X, y, groups)):
-        print(f"\n--- Fold {fold + 1}/{n_splits} ---")
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+    y_true_all = []
+    y_pred_all = []
+    fold_metrics = []
 
-        # Print class distributions
-        print(f"Train samples: {len(y_train)}, Test samples: {len(y_test)}")
-        print("Train dist (pre-oversample):", dict(Counter(y_train)))
-        print("Test dist:", dict(Counter(y_test)))
+    # Manual CV loop because GroupKFold/StratifiedGroupKFold accept groups in split()
+    fold_idx = 0
+    for train_idx, test_idx in cv.split(X, y, groups):
+        fold_idx += 1
+        Xtr, Xte = X[train_idx], X[test_idx]
+        ytr, yte = y[train_idx], y[test_idx]
 
-        # --- Oversample the minority classes on TRAIN set only ---
-        ros = RandomOverSampler(random_state=seed)
-        try:
-            X_train_res, y_train_res = ros.fit_resample(X_train, y_train)
-            print("Train dist (post-oversample):", dict(Counter(y_train_res)))
-        except Exception as e:
-            print("Oversampling failed, continuing without it:", e)
-            X_train_res, y_train_res = X_train, y_train
+        # Fit
+        pipeline.fit(Xtr, ytr)
+        ypred = pipeline.predict(Xte)
 
-        # Pipeline (scaler + classifier) -- reinstantiate per fold
-        pipeline = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "clf",
-                    RandomForestClassifier(
-                        n_estimators=300, random_state=seed, class_weight="balanced", n_jobs=-1
-                    ),
-                ),
-            ]
-        )
+        # Collect
+        y_true_all.extend(yte.tolist())
+        y_pred_all.extend(ypred.tolist())
 
-        # Fit on the oversampled training set
-        pipeline.fit(X_train_res, y_train_res)
-        y_pred = pipeline.predict(X_test)
+        # Per-fold metrics
+        acc = float(accuracy_score(yte, ypred))
+        f1 = float(f1_score(yte, ypred, average="weighted", zero_division=0))
+        prec = float(precision_score(yte, ypred, average="weighted", zero_division=0))
+        rec = float(recall_score(yte, ypred, average="weighted", zero_division=0))
+        fold_metrics.append({"fold": fold_idx, "acc": acc, "f1_weighted": f1, "precision_weighted": prec, "recall_weighted": rec, "n_test": len(yte)})
 
-        all_y_test.extend(y_test)
-        all_y_pred.extend(y_pred)
+    # Overall report
+    y_true_all = np.array(y_true_all)
+    y_pred_all = np.array(y_pred_all)
 
-        # per-fold macro metrics
-        p, r, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="macro", zero_division=0)
-        acc = accuracy_score(y_test, y_pred)
-        fold_metrics_list.append(
-            {
-                "fold": fold + 1,
-                "accuracy": float(acc),
-                "precision_macro": float(p),
-                "recall_macro": float(r),
-                "f1_macro": float(f1),
-                "n_test_samples": int(len(y_test)),
-            }
-        )
+    # If no predictions produced (shouldn't happen), raise
+    if y_pred_all.size == 0:
+        raise RuntimeError("Cross-validation produced no predictions (empty).")
 
-    print("\nCross-Validation complete.")
-
-    # Classification report aggregated
-    report = classification_report(all_y_test, all_y_pred, target_names=class_names, labels=class_names, zero_division=0)
-
-    # Save per-fold metrics to CSV (numeric-only mean/std)
-    metrics_df = pd.DataFrame(fold_metrics_list)
-    num_cols = metrics_df.select_dtypes(include=[np.number]).columns
-    mean_row = metrics_df[num_cols].mean().to_dict()
-    std_row = metrics_df[num_cols].std().to_dict()
-    mean_row["fold"] = "Mean"
-    std_row["fold"] = "StdDev"
-    metrics_df = pd.concat([metrics_df, pd.DataFrame([mean_row, std_row])], ignore_index=True)
-
-    metrics_csv_path = os.path.join(plots_dir, "cv_metrics_summary.csv")
-    metrics_df.to_csv(metrics_csv_path, index=False, float_format="%.4f")
-
-    report += "\n\nMean Metrics (from folds):\n"
-    report += metrics_df[metrics_df["fold"] == "Mean"].to_string(index=False)
-    report += "\n\nStdDev Metrics (from folds):\n"
-    report += metrics_df[metrics_df["fold"] == "StdDev"].to_string(index=False)
-
-    # Train final pipeline on entire dataset (optionally oversampled)
-    print("\nTraining final model on all data (with oversampling)...")
-    ros_final = RandomOverSampler(random_state=seed)
+    # Classification report
     try:
-        X_res_full, y_res_full = ros_final.fit_resample(X, y)
-        print("Full train dist (post-oversample):", dict(Counter(y_res_full)))
-    except Exception as e:
-        print("Full-dataset oversampling failed, training on raw dataset:", e)
-        X_res_full, y_res_full = X, y
+        target_names = [str(c) for c in class_names]
+        report_text = classification_report(y_true_all, y_pred_all, target_names=target_names, zero_division=0)
+    except Exception:
+        # fallback without target names
+        report_text = classification_report(y_true_all, y_pred_all, zero_division=0)
 
+    # Confusion matrix (aggregate)
+    cm = confusion_matrix(y_true_all, y_pred_all)
+    cm_path = os.path.join(plots_dir, "confusion_matrix.csv")
+    # save as CSV for easy viewing
+    cm_df = pd.DataFrame(cm)
+    cm_df.to_csv(cm_path, index=False)
+    # Save per-fold metrics
+    metrics_csv_path = os.path.join(plots_dir, "cv_fold_metrics.csv")
+    pd.DataFrame(fold_metrics).to_csv(metrics_csv_path, index=False)
+
+    # Train final model on all data
     final_pipeline = Pipeline(
         [
             ("scaler", StandardScaler()),
-            ("clf", RandomForestClassifier(n_estimators=300, random_state=seed, class_weight="balanced", n_jobs=-1)),
+            ("clf", RandomForestClassifier(n_estimators=150, class_weight="balanced", random_state=seed, n_jobs=-1)),
         ]
     )
-    final_pipeline.fit(X_res_full, y_res_full)
+    final_pipeline.fit(X, y)
 
-    # Save final pipeline compressed
-    final_model_path = os.path.join(models_dir, "arrhythmia_classifier_pipeline.joblib")
-    joblib.dump(final_pipeline, final_model_path, compress=3)
+    final_model_path = os.path.join(models_dir, "final_pipeline.joblib")
+    joblib.dump(final_pipeline, final_model_path)
 
-    final_classes = None
-    try:
-        final_classes = final_pipeline.named_steps["clf"].classes_
-    except Exception:
-        final_classes = np.unique(y)
+    # Save textual report
+    report_path = os.path.join(plots_dir, "classification_report.txt")
+    with open(report_path, "w") as f:
+        f.write(report_text)
 
-    # Confusion matrix (from all folds)
-    plot_path = os.path.join(plots_dir, "confusion_matrix.png")
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ConfusionMatrixDisplay.from_predictions(all_y_test, all_y_pred, ax=ax, cmap="Blues", normalize="true", xticks_rotation="vertical", labels=class_names)
-    plt.title(f"Normalized Confusion Matrix (from {n_splits}-Fold CV)")
-    plt.tight_layout()
-    plt.savefig(plot_path, bbox_inches="tight")
-    plt.close(fig)
-
-    return report, plot_path, metrics_csv_path, final_model_path, final_classes
+    # Return values (report_text, cm_path, metrics_csv_path, final_model_path, classes_array)
+    classes_array = np.array(sorted(list(set(y.tolist()))))
+    return report_text, cm_path, metrics_csv_path, final_model_path, classes_array
