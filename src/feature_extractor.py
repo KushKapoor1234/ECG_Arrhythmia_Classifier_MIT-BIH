@@ -1,190 +1,229 @@
+# src/feature_extractor.py
+"""
+Build beat-level feature dataset, integrating TF features per-beat.
+
+Primary function:
+ - build_feature_dataset(all_records, pre_ms=200, post_ms=400, lead=0)
+
+Returns:
+ - X: numpy array (n_beats, n_features)
+ - y: numpy array (n_beats,) integer labels (unlabeled beats -> -1)
+ - groups: numpy array (n_beats,) group id (record name for subject-wise CV)
+Also writes per-record 'tf_beats.csv' into out_tf_root/record_<name>/
+"""
+
+import os
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
-from scipy.signal import welch
 
-# Define which annotation symbols are considered "beats"
-BEAT_SYMBOLS = ["N", "L", "R", "V", "A", "a", "J", "S", "j", "e", "E", "/"]
+from .signal_processor import pan_tompkins_detector
+from .features_tf import extract_tf_features_from_beat_window, extract_coherence_summary
 
-# Grouped class mapping
+# conservative default label map (adjust if your annotations use other symbols)
 BEAT_CLASS_MAP = {
-    "N": "N",
-    "L": "N",
-    "R": "N",
-    "e": "N",
-    "j": "N",  # Normal and Bundle Branch Blocks
-    "V": "V",
-    "E": "V",  # Ventricular Ectopic Beats
-    "A": "S",
-    "a": "S",
-    "J": "S",
-    "S": "S",  # Supraventricular Ectopic Beats
-    "/": "Q",  # Paced Beats
+    'N': 0,  # normal
+    'L': 0,  # left bundle branch block (map to normal or adjust)
+    'R': 0,  # right bundle branch block
+    'V': 1,  # ventricular ectopic
+    'A': 2,  # atrial ectopic
+    'F': 3,  # fusion
+    'Q': 4,  # unknown / paced / other
 }
 
-# Export feature names (extended)
-FEATURE_NAMES = [
-    "rr_pre_ms",
-    "rr_post_ms",
-    "qrs_amplitude_max_mv",
-    "qrs_amplitude_min_mv",
-    "qrs_area_mvs",
-    "qrs_width_ms",
-    "qrs_max_slope_mv_per_s",
-    "qrs_spectral_entropy",
+# base (non-TF) beat features:
+BASE_FEATURE_NAMES = [
+    'win_mean', 'win_std', 'win_max', 'win_min', 'win_ptp', 'win_energy', 'pre_rr', 'post_rr'
 ]
 
-# helper: spectral entropy
-def spectral_entropy(x, fs, nfft=None):
-    if nfft is None:
-        nfft = min(1024, len(x))
-    # compute PSD (Welch), restrict to >0 Hz
-    f, pxx = welch(x, fs=fs, nperseg=nfft)
-    pxx = pxx.copy()
-    pxx = pxx[f > 0]
-    f = f[f > 0]
-    if pxx.size == 0:
-        return 0.0
-    p = pxx / np.sum(pxx)
-    # numerical stability
-    p = np.maximum(p, 1e-12)
-    se = -np.sum(p * np.log2(p))
-    return float(se)
+# TF beat feature names (prefix 'beat_')
+BEAT_TF_NAMES = [
+    'beat_cwt_low', 'beat_cwt_mid', 'beat_cwt_high', 'beat_cwt_total',
+    'beat_lomb_peak_freq', 'beat_lomb_peak_power'
+]
+COHERENCE_NAMES = ['coh_low_mean', 'coh_mid_mean', 'coh_high_mean']
+
+FEATURE_NAMES = BASE_FEATURE_NAMES + BEAT_TF_NAMES + COHERENCE_NAMES
 
 
-def estimate_qrs_width_ms(beat_window, fs):
+def _ensure_sig_shape(sig):
+    """Return signal as (n_channels, n_samples)."""
+    arr = np.asarray(sig)
+    if arr.ndim == 1:
+        return arr[np.newaxis, :]
+    if arr.ndim == 2:
+        # if shape (n_samples, n_channels) convert to (channels, samples)
+        if arr.shape[0] > arr.shape[1]:
+            return arr.T
+        return arr
+    raise ValueError("Unsupported signal shape")
+
+
+def _extract_base_features(window):
     """
-    Approximate QRS width using half-maximum width of absolute signal in window.
-    Returns width in milliseconds or np.nan if cannot be measured.
+    Simple time-domain features for a window (1D array).
     """
-    x = np.abs(beat_window)
-    if x.size < 3:
-        return np.nan
-    peak_idx = np.argmax(x)
-    peak_val = x[peak_idx]
-    if peak_val <= 0:
-        return np.nan
-    half = 0.5 * peak_val
-
-    # find left crossing
-    left = peak_idx
-    while left > 0 and x[left] > half:
-        left -= 1
-    # find right crossing
-    right = peak_idx
-    while right < len(x) - 1 and x[right] > half:
-        right += 1
-
-    width_samples = max(1, right - left)
-    width_ms = (width_samples / fs) * 1000.0
-    return float(width_ms)
+    w = np.asarray(window, dtype=float)
+    feats = {
+        'win_mean': float(np.mean(w)),
+        'win_std': float(np.std(w)),
+        'win_max': float(np.max(w)),
+        'win_min': float(np.min(w)),
+        'win_ptp': float(np.ptp(w)),
+        'win_energy': float(np.sum(w.astype(float) ** 2))
+    }
+    return feats
 
 
-def build_feature_dataset(all_records):
+def build_feature_dataset(all_records, pre_ms=200, post_ms=400, lead=0, lead2=None, out_tf_root="outputs/tf"):
     """
-    Extract features for each valid beat, return X, y, groups.
+    Build beat-level dataset:
+      - all_records: list of dicts with keys: 'name','signal','fs' and optionally 'ann_locs' and 'ann_labels'
+      - pre_ms, post_ms: window around R-peak
+      - lead: which channel index to use for beat windows
+      - lead2: optional second lead index for coherence features
+    Returns X, y, groups (y entries are ints; unlabeled beats -> -1)
+    Also writes per-record 'tf_beats.csv' into out_tf_root/record_<name>/tf_beats.csv
     """
-    X_all = []
-    y_all = []
-    groups_all = []
+    os.makedirs(out_tf_root, exist_ok=True)
+    rows = []
+    rec_counter = 0
 
-    print("Extracting features from records (enhanced features)...")
-    for record in tqdm(all_records):
-        signal = record["signal"][:, 0]
-        fs = record["fs"]
-        ann_samples = record["ann_samples"]
-        ann_symbols = record["ann_symbols"]
-        rec_name = record["name"]
+    for rec in tqdm(all_records, desc="records"):
+        rec_name = rec.get('name', f"rec{rec_counter}")
+        fs = float(rec.get('fs', 360.0))
+        sig = rec.get('signal', None)
+        if sig is None:
+            rec_counter += 1
+            continue
+        sig = _ensure_sig_shape(sig)  # (channels, samples)
+        nchan, nsamp = sig.shape
+        lead_idx = min(lead, nchan - 1)
+        lead2_idx = None if lead2 is None else min(lead2, nchan - 1)
 
-        valid_indices = [i for i, sym in enumerate(ann_symbols) if BEAT_CLASS_MAP.get(sym) is not None]
+        # attempt to use annotations if present
+        ann_locs = None
+        ann_labels = None
+        # support various key names used by different loaders
+        for k in ('ann_locs', 'ann_samples', 'r_peaks', 'r_locations'):
+            if k in rec:
+                ann_locs = np.asarray(rec[k]).astype(int)
+                break
+        for k in ('ann_labels', 'ann_symbols', 'labels', 'symbols'):
+            if k in rec:
+                ann_labels = np.asarray(rec[k])
+                break
 
-        if not valid_indices:
+        # if no ann_locs then detect peaks
+        if ann_locs is None or len(ann_locs) == 0:
+            try:
+                r_peaks = pan_tompkins_detector(sig[lead_idx, :], fs)
+                ann_locs = np.asarray(r_peaks).astype(int)
+                ann_labels = None
+            except Exception:
+                ann_locs = np.array([], dtype=int)
+                ann_labels = None
+
+        if ann_locs is None or len(ann_locs) == 0:
+            rec_counter += 1
             continue
 
-        true_beat_samples = ann_samples[valid_indices]
-        true_beat_labels = [BEAT_CLASS_MAP[ann_symbols[i]] for i in valid_indices]
+        pre_samps = int(round(pre_ms * fs / 1000.0))
+        post_samps = int(round(post_ms * fs / 1000.0))
 
-        for i in range(len(true_beat_samples)):
-            sample = int(true_beat_samples[i])
-            label = true_beat_labels[i]
+        # per-record TF beat CSV
+        rec_out_dir = os.path.join(out_tf_root, f"record_{rec_name}")
+        os.makedirs(rec_out_dir, exist_ok=True)
+        beat_rows = []
 
-            # Need previous and next beat to compute RR; skip first/last
-            if i == 0 or i == (len(true_beat_samples) - 1):
+        # compute RR intervals for pre_rr/post_rr where possible
+        rlocs = ann_locs
+        rr_intervals = np.diff(rlocs) / fs  # seconds between r-peaks, length n-1
+
+        for i, r in enumerate(rlocs):
+            s = int(r - pre_samps)
+            e = int(r + post_samps)
+            if s < 0 or e > nsamp:
                 continue
+            window = sig[lead_idx, s:e]
 
-            features = extract_features_for_beat(signal, sample, true_beat_samples, i, fs)
-            if features is None:
-                continue
+            # base time-domain features
+            base_feats = _extract_base_features(window)
 
-            X_all.append(features)
-            y_all.append(label)
-            groups_all.append(rec_name)
+            # rr features
+            pre_rr = rr_intervals[i-1] if i-1 >= 0 and i-1 < len(rr_intervals) else np.nan
+            post_rr = rr_intervals[i] if i < len(rr_intervals) else np.nan
+            base_feats['pre_rr'] = float(pre_rr) if not np.isnan(pre_rr) else float('nan')
+            base_feats['post_rr'] = float(post_rr) if not np.isnan(post_rr) else float('nan')
 
-    return np.array(X_all, dtype=float), np.array(y_all, dtype=object), np.array(groups_all, dtype=object)
+            # per-beat TF features
+            tf_feats = extract_tf_features_from_beat_window(window, fs)
 
+            # coherence features if second lead present
+            coh_feats = {}
+            if lead2_idx is not None and lead2_idx < nchan:
+                win2 = sig[lead2_idx, s:e]
+                coh_feats = extract_coherence_summary(window, win2, fs)
+            else:
+                coh_feats = {n: float('nan') for n in COHERENCE_NAMES}
 
-def extract_features_for_beat(signal, beat_sample, all_beat_samples, beat_index, fs):
-    """
-    Feature vector for one beat:
-      - rr_pre_ms
-      - rr_post_ms
-      - qrs_amplitude_max_mv
-      - qrs_amplitude_min_mv
-      - qrs_area_mvs
-      - qrs_width_ms
-      - qrs_max_slope_mv_per_s
-      - qrs_spectral_entropy
-    """
-    # RR in samples -> ms
-    try:
-        rr_pre_samples = int(beat_sample - all_beat_samples[beat_index - 1])
-        rr_post_samples = int(all_beat_samples[beat_index + 1] - beat_sample)
-    except Exception:
-        return None
+            # build label: prefer ann_labels if present
+            label = None
+            if ann_labels is not None and i < len(ann_labels):
+                lab = ann_labels[i]
+                # if symbol-based mapping
+                if isinstance(lab, str) and lab in BEAT_CLASS_MAP:
+                    label = BEAT_CLASS_MAP[lab]
+                else:
+                    try:
+                        label = int(lab)
+                    except Exception:
+                        label = None
 
-    rr_pre_ms = (rr_pre_samples / fs) * 1000.0
-    rr_post_ms = (rr_post_samples / fs) * 1000.0
+            # --- NEW: Do not drop unlabeled beats; mark them ---
+            if label is None:
+                labelled_flag = False
+                label_val = -1
+            else:
+                labelled_flag = True
+                label_val = int(label)
 
-    # 100ms window (50ms before/after)
-    window_size_samples = max(1, int(0.05 * fs))
-    window_start = max(0, int(beat_sample - window_size_samples))
-    window_end = min(len(signal), int(beat_sample + window_size_samples))
+            # combine all features
+            combined = {'record': rec_name, 'beat_index': int(i), 'peak_sample': int(r)}
+            combined.update(base_feats)
+            combined.update(tf_feats)
+            combined.update(coh_feats)
+            combined['label'] = label_val
+            combined['is_labelled'] = bool(labelled_flag)
 
-    beat_window = signal[window_start:window_end]
+            # append to per-record and global lists
+            beat_rows.append(combined)
+            rows.append(combined)
 
-    # Guard small/empty windows
-    if beat_window.size < max(3, int(0.01 * fs)):
-        return None
+        # write per-record per-beat tf CSV (may include unlabeled beats with label=-1)
+        if beat_rows:
+            df_rec = pd.DataFrame(beat_rows)
+            try:
+                df_rec.to_csv(os.path.join(rec_out_dir, "tf_beats.csv"), index=False)
+            except Exception:
+                pass
 
-    qrs_amplitude_max = float(np.max(beat_window))
-    qrs_amplitude_min = float(np.min(beat_window))
-    qrs_area = float(np.trapz(np.abs(beat_window))) / fs  # mV * seconds
+        rec_counter += 1
 
-    # width estimation (ms)
-    qrs_width_ms = estimate_qrs_width_ms(beat_window, fs)
-    if np.isnan(qrs_width_ms):
-        qrs_width_ms = 0.0
+    # finalize dataframe
+    if len(rows) == 0:
+        # return empty numpy arrays but keep FEATURE_NAMES length
+        return np.zeros((0, len(FEATURE_NAMES))), np.zeros((0,), dtype=int), np.zeros((0,), dtype=object)
 
-    # max slope (mv / s) computed from first diff
-    diffs = np.diff(beat_window)
-    if diffs.size == 0:
-        max_slope = 0.0
-    else:
-        # diffs per sample -> slope per second
-        max_slope = float(np.max(np.abs(diffs)) * fs)
+    df_all = pd.DataFrame(rows)
 
-    # spectral entropy of window
-    try:
-        spec_ent = spectral_entropy(beat_window, fs)
-    except Exception:
-        spec_ent = 0.0
+    # ensure FEATURE_NAMES present in dataframe; fill missing with nan
+    for c in FEATURE_NAMES:
+        if c not in df_all.columns:
+            df_all[c] = float('nan')
 
-    return [
-        rr_pre_ms,
-        rr_post_ms,
-        qrs_amplitude_max,
-        qrs_amplitude_min,
-        qrs_area,
-        qrs_width_ms,
-        max_slope,
-        spec_ent,
-    ]
+    # finalize X,y,groups
+    X = df_all[FEATURE_NAMES].values.astype(float)
+    y = df_all['label'].fillna(-1).astype(int).values
+    groups = np.array(df_all['record'].values)
+    return X, y, groups
